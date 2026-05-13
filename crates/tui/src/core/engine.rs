@@ -210,6 +210,40 @@ impl Default for EngineConfig {
     }
 }
 
+/// Reason the active turn was cancelled. The token from `tokio_util`
+/// does not carry a cause, so the engine keeps a sibling latch for
+/// approval and user-input waits that need to explain cancellation.
+///
+/// `External`, `Preempted`, and `Internal` are reserved for the
+/// remaining direct cancellation paths tracked in #1541.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum CancelReason {
+    /// User-initiated cancel (Esc, `/cancel`, click cancel on modal).
+    User,
+    /// External / runtime-API cancel (HTTP `DELETE /v1/threads/...`,
+    /// task manager stop, parent agent cancel).
+    External,
+    /// Cancel triggered when a new turn starts before the previous one
+    /// finished — e.g. plain Enter while busy after the queueing path
+    /// pre-empts the running turn.
+    Preempted,
+    /// Engine internals tore down the turn (drop, channel close,
+    /// shutdown). Rare — surfaced as an internal error.
+    Internal,
+}
+
+impl CancelReason {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::User => "user cancelled the request",
+            Self::External => "request cancelled by external caller",
+            Self::Preempted => "request was preempted by a new turn",
+            Self::Internal => "engine torn down before approval resolved",
+        }
+    }
+}
+
 /// Handle to communicate with the engine
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -219,6 +253,10 @@ pub struct EngineHandle {
     pub rx_event: Arc<RwLock<mpsc::Receiver<Event>>>,
     /// Shared pointer to the cancellation token for the current request.
     cancel_token: Arc<StdMutex<CancellationToken>>,
+    /// Latched reason for the most recent cancellation. Read by the
+    /// approval / user-input handlers to enrich their error strings.
+    /// Cleared by the engine when a fresh turn starts.
+    cancel_reason: Arc<StdMutex<Option<CancelReason>>>,
     /// Send approval decisions to the engine
     tx_approval: mpsc::Sender<ApprovalDecision>,
     /// Send user input responses to the engine
@@ -234,8 +272,20 @@ impl EngineHandle {
         Ok(())
     }
 
-    /// Cancel the current request
+    /// Cancel the current request (user-initiated path — keeps the
+    /// public `cancel()` signature stable). Equivalent to
+    /// `cancel_with_reason(CancelReason::User)`.
     pub fn cancel(&self) {
+        self.cancel_with_reason(CancelReason::User);
+    }
+
+    /// Cancel the current request and latch the reason so downstream
+    /// "request cancelled" error messages can name a cause.
+    pub fn cancel_with_reason(&self, reason: CancelReason) {
+        match self.cancel_reason.lock() {
+            Ok(mut slot) => *slot = Some(reason),
+            Err(poisoned) => *poisoned.into_inner() = Some(reason),
+        }
         match self.cancel_token.lock() {
             Ok(token) => token.cancel(),
             Err(poisoned) => poisoned.into_inner().cancel(),
@@ -340,6 +390,11 @@ pub struct Engine {
     pub(super) rx_subagent_completion: mpsc::UnboundedReceiver<SubAgentCompletion>,
     cancel_token: CancellationToken,
     shared_cancel_token: Arc<StdMutex<CancellationToken>>,
+    /// Latched reason for the current cancellation, mirrored to
+    /// `EngineHandle::cancel_reason`. Read by `approval.rs` when
+    /// surfacing the "Request cancelled while awaiting …" error so the
+    /// user-facing message names a cause.
+    pub(super) cancel_reason: Arc<StdMutex<Option<CancelReason>>>,
     tool_exec_lock: Arc<RwLock<()>>,
     capacity_controller: CapacityController,
     /// Append-only layered context manager (#159). Opt-in for v0.7.5 while
@@ -378,6 +433,13 @@ impl Engine {
             Err(poisoned) => {
                 *poisoned.into_inner() = token;
             }
+        }
+        // Fresh turn → clear any latched cancellation reason from the
+        // previous turn so a downstream "request cancelled" message
+        // doesn't inherit a stale cause.
+        match self.cancel_reason.lock() {
+            Ok(mut slot) => *slot = None,
+            Err(poisoned) => *poisoned.into_inner() = None,
         }
     }
 
@@ -431,6 +493,7 @@ impl Engine {
         let (tx_subagent_completion, rx_subagent_completion) = mpsc::unbounded_channel();
         let cancel_token = CancellationToken::new();
         let shared_cancel_token = Arc::new(StdMutex::new(cancel_token.clone()));
+        let cancel_reason: Arc<StdMutex<Option<CancelReason>>> = Arc::new(StdMutex::new(None));
         let tool_exec_lock = Arc::new(RwLock::new(()));
 
         // Create clients for both providers
@@ -565,6 +628,7 @@ impl Engine {
             rx_subagent_completion,
             cancel_token: cancel_token.clone(),
             shared_cancel_token: shared_cancel_token.clone(),
+            cancel_reason: cancel_reason.clone(),
             tool_exec_lock,
             capacity_controller,
             seam_manager,
@@ -581,6 +645,7 @@ impl Engine {
             tx_op,
             rx_event: Arc::new(RwLock::new(rx_event)),
             cancel_token: shared_cancel_token,
+            cancel_reason,
             tx_approval,
             tx_user_input,
             tx_steer,
@@ -784,15 +849,6 @@ impl Engine {
                 }
                 Op::CompactContext => {
                     self.handle_manual_compaction().await;
-                }
-                Op::Rlm {
-                    content,
-                    model,
-                    child_model,
-                    max_depth,
-                } => {
-                    self.handle_rlm(content, model, child_model, max_depth)
-                        .await;
                 }
                 Op::EditLastTurn { new_message } => {
                     // #383: /edit — remove the last user+assistant exchange
@@ -1270,100 +1326,6 @@ impl Engine {
                 usage: zero_usage,
                 status: turn_status,
                 error: turn_error,
-            })
-            .await;
-    }
-
-    /// Handle a Recursive Language Model (RLM) query — Algorithm 1 from
-    /// Zhang et al. (arXiv:2512.24601).
-    ///
-    /// The prompt is stored as PROMPT in a REPL variable. The root LLM
-    /// only sees metadata about the REPL state, never the prompt text
-    /// directly. The model generates Python code, which is executed by
-    /// the REPL. When FINAL() is called, the loop ends.
-    async fn handle_rlm(
-        &mut self,
-        content: String,
-        model: String,
-        child_model: String,
-        max_depth: u32,
-    ) {
-        use crate::rlm::turn::run_rlm_turn;
-
-        let Some(ref client) = self.deepseek_client else {
-            let err = self
-                .deepseek_client_error
-                .as_deref()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "API client not configured".to_string());
-            let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(format!(
-                    "RLM error: {err}"
-                ))))
-                .await;
-            return;
-        };
-
-        let _ = self
-            .tx_event
-            .send(Event::status("RLM turn started".to_string()))
-            .await;
-
-        let result = run_rlm_turn(
-            client,
-            model,
-            content,
-            child_model,
-            self.tx_event.clone(),
-            max_depth,
-        )
-        .await;
-
-        let has_error = result.error.is_some();
-        if let Some(ref err) = result.error {
-            let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::tool(format!(
-                    "RLM error: {err}"
-                ))))
-                .await;
-        }
-
-        if !result.answer.is_empty() {
-            // Add the final answer as an assistant message in the session.
-            self.add_session_message(crate::models::Message {
-                role: "assistant".to_string(),
-                content: vec![crate::models::ContentBlock::Text {
-                    text: result.answer.clone(),
-                    cache_control: None,
-                }],
-            })
-            .await;
-
-            let _ = self
-                .tx_event
-                .send(Event::MessageDelta {
-                    index: 0,
-                    content: result.answer.clone(),
-                })
-                .await;
-            let _ = self
-                .tx_event
-                .send(Event::MessageComplete { index: 0 })
-                .await;
-        }
-
-        let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
-                usage: result.usage,
-                status: if has_error {
-                    crate::core::events::TurnOutcomeStatus::Failed
-                } else {
-                    crate::core::events::TurnOutcomeStatus::Completed
-                },
-                error: result.error,
             })
             .await;
     }
@@ -2022,10 +1984,12 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
     let (tx_steer, rx_steer) = mpsc::channel(64);
     let cancel_token = CancellationToken::new();
     let shared_cancel_token = Arc::new(StdMutex::new(cancel_token.clone()));
+    let cancel_reason: Arc<StdMutex<Option<CancelReason>>> = Arc::new(StdMutex::new(None));
     let handle = EngineHandle {
         tx_op,
         rx_event: Arc::new(RwLock::new(rx_event)),
         cancel_token: shared_cancel_token,
+        cancel_reason,
         tx_approval,
         tx_user_input,
         tx_steer,

@@ -102,7 +102,8 @@ use super::approval::{
     ApprovalMode, ApprovalRequest, ApprovalView, ElevationRequest, ElevationView, ReviewDecision,
 };
 use super::history::{
-    HistoryCell, ToolCell, ToolStatus, history_cells_from_message, summarize_tool_output,
+    HistoryCell, ToolCell, ToolStatus, TranscriptRenderOptions, history_cells_from_message,
+    summarize_tool_output,
 };
 use super::slash_menu::{
     apply_slash_menu_selection, try_autocomplete_slash_command, visible_slash_menu_entries,
@@ -128,6 +129,7 @@ const SLASH_MENU_LIMIT: usize = 128;
 const MENTION_MENU_LIMIT: usize = 6;
 const MIN_CHAT_HEIGHT: u16 = 3;
 const MIN_COMPOSER_HEIGHT: u16 = 2;
+const COMPOSER_ARROW_SCROLL_LINES: usize = 3;
 const CONTEXT_WARNING_THRESHOLD_PERCENT: f64 = 85.0;
 const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
 const UI_IDLE_POLL_MS: u64 = 48;
@@ -144,6 +146,7 @@ const SIDEBAR_VISIBLE_MIN_WIDTH: u16 = 100;
 const DEFAULT_TERMINAL_PROBE_TIMEOUT_MS: u64 = 500;
 const TURN_META_PREFIX: &str = "<turn_meta>";
 const SESSION_TITLE_MAX_CHARS: usize = 32;
+const PERIODIC_FULL_REPAINT_EVERY_N: u64 = 50;
 
 type AppTerminal = Terminal<ColorCompatBackend<Stdout>>;
 
@@ -434,6 +437,8 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
         // #456: plumb the App's HookExecutor so `exec_shell` can surface
         // the configured `shell_env` hooks. Wrapped in Arc once and shared.
         hook_executor: Some(std::sync::Arc::new(app.hooks.clone())),
+        handle_store: app.runtime_services.handle_store.clone(),
+        rlm_sessions: app.runtime_services.rlm_sessions.clone(),
     };
     refresh_active_task_panel(&mut app, &task_manager).await;
 
@@ -688,7 +693,11 @@ fn active_rlm_task_entries(app: &App) -> Vec<TaskPanelEntry> {
             let HistoryCell::Tool(ToolCell::Generic(generic)) = entry else {
                 return None;
             };
-            if generic.name != "rlm" || generic.status != ToolStatus::Running {
+            if !matches!(
+                generic.name.as_str(),
+                "rlm_open" | "rlm_eval" | "rlm_configure" | "rlm_close" | "rlm"
+            ) || generic.status != ToolStatus::Running
+            {
                 return None;
             }
             let summary = generic
@@ -737,6 +746,7 @@ async fn run_event_loop(
     let mut web_config_session: Option<WebConfigSession> = None;
     let mut terminal_paused_at: Option<Instant> = None;
     let mut force_terminal_repaint = false;
+    let mut draws_since_last_full_repaint: u64 = 0;
 
     loop {
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
@@ -1074,9 +1084,17 @@ async fn run_event_loop(
                         // Note this dispatch so the next sub-agent `Started`
                         // mailbox envelope routes into the right card kind
                         // (delegate vs fanout).
-                        if matches!(name.as_str(), "agent_spawn" | "rlm" | "delegate") {
+                        if matches!(
+                            name.as_str(),
+                            "agent_open"
+                                | "agent_spawn"
+                                | "rlm_open"
+                                | "rlm_eval"
+                                | "rlm"
+                                | "delegate"
+                        ) {
                             app.pending_subagent_dispatch = Some(name.clone());
-                            if name == "rlm" {
+                            if matches!(name.as_str(), "rlm_open" | "rlm_eval" | "rlm") {
                                 // New fanout invocation — children should
                                 // group under a fresh card, not the
                                 // previous fanout's leftover.
@@ -1115,7 +1133,9 @@ async fn run_event_loop(
                         // poll. Also merge shell jobs (#373).
                         if matches!(
                             name.as_str(),
-                            "agent_spawn"
+                            "agent_open"
+                                | "agent_spawn"
+                                | "agent_close"
                                 | "agent_cancel"
                                 | "todo_write"
                                 | "task_shell_start"
@@ -1126,7 +1146,9 @@ async fn run_event_loop(
                         }
                         if matches!(
                             name.as_str(),
-                            "agent_spawn"
+                            "agent_open"
+                                | "agent_eval"
+                                | "agent_close"
                                 | "agent_cancel"
                                 | "agent_wait"
                                 | "agent_result"
@@ -1169,7 +1191,11 @@ async fn run_event_loop(
                         status,
                         error,
                     } => {
-                        force_terminal_repaint = true;
+                        if !matches!(status, crate::core::events::TurnOutcomeStatus::Completed)
+                            || draws_since_last_full_repaint >= PERIODIC_FULL_REPAINT_EVERY_N
+                        {
+                            force_terminal_repaint = true;
+                        }
                         // Finalize any in-flight tool group. Cancellation
                         // marks still-running entries as Failed so the user
                         // sees they were interrupted rather than the spinner
@@ -1853,8 +1879,14 @@ async fn run_event_loop(
             None
         };
         if app.needs_redraw && draw_wait.is_none() {
+            let was_full_repaint = force_terminal_repaint;
             draw_app_frame_inner(terminal, app, force_terminal_repaint)?;
             force_terminal_repaint = false;
+            if was_full_repaint {
+                draws_since_last_full_repaint = 0;
+            } else {
+                draws_since_last_full_repaint = draws_since_last_full_repaint.saturating_add(1);
+            }
             frame_rate_limiter.mark_emitted(Instant::now());
             app.needs_redraw = false;
         }
@@ -2001,7 +2033,6 @@ async fn run_event_loop(
                     );
                 }
 
-                reset_terminal_viewport(terminal, app.synchronized_output_enabled)?;
                 app.handle_resize(final_w, final_h);
                 // #macos-resize: some terminals (macOS Terminal.app, Windows
                 // ConHost) briefly report stale dimensions via
@@ -2017,11 +2048,8 @@ async fn run_event_loop(
                     let backend = terminal.backend_mut();
                     backend.force_size(Size::new(final_w, final_h));
                 }
-                // Draw immediately so the cleared screen gets repainted before
-                // any other events can interleave. Without this, the next
-                // iteration's draw can race against fast follow-up input and
-                // leave the user staring at a blank/partial frame.
-                draw_app_frame(terminal, app)?;
+                draw_app_frame_inner(terminal, app, true)?;
+                draws_since_last_full_repaint = 0;
                 {
                     let backend = terminal.backend_mut();
                     backend.clear_forced_size();
@@ -2033,6 +2061,9 @@ async fn run_event_loop(
             if app.use_mouse_capture
                 && let Event::Mouse(mouse) = evt
             {
+                if should_drop_loading_mouse_motion(app, mouse) {
+                    continue;
+                }
                 let events = handle_mouse_event(app, mouse);
                 if handle_view_events(
                     terminal,
@@ -2470,7 +2501,7 @@ async fn run_event_loop(
                 KeyCode::Char('o')
                     if key.modifiers.contains(KeyModifiers::CONTROL)
                         && app.input.is_empty()
-                        && open_thinking_pager(app) =>
+                        && open_activity_detail_pager(app) =>
                 {
                     continue;
                 }
@@ -2482,8 +2513,8 @@ async fn run_event_loop(
                 }
                 KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => {
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.set_sidebar_focus(SidebarFocus::Plan);
-                        app.status_message = Some("Sidebar focus: plan".to_string());
+                        app.set_sidebar_focus(SidebarFocus::Work);
+                        app.status_message = Some("Sidebar focus: work".to_string());
                     } else {
                         app.set_mode(AppMode::Plan);
                     }
@@ -2491,8 +2522,8 @@ async fn run_event_loop(
                 }
                 KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => {
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.set_sidebar_focus(SidebarFocus::Todos);
-                        app.status_message = Some("Sidebar focus: todos".to_string());
+                        app.set_sidebar_focus(SidebarFocus::Tasks);
+                        app.status_message = Some("Sidebar focus: tasks".to_string());
                     } else {
                         app.set_mode(AppMode::Agent);
                     }
@@ -2500,8 +2531,8 @@ async fn run_event_loop(
                 }
                 KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => {
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        app.set_sidebar_focus(SidebarFocus::Tasks);
-                        app.status_message = Some("Sidebar focus: tasks".to_string());
+                        app.set_sidebar_focus(SidebarFocus::Agents);
+                        app.status_message = Some("Sidebar focus: agents".to_string());
                     } else {
                         app.set_mode(AppMode::Yolo);
                     }
@@ -2512,26 +2543,23 @@ async fn run_event_loop(
                     continue;
                 }
                 KeyCode::Char('!') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    app.set_sidebar_focus(SidebarFocus::Plan);
-                    app.status_message = Some("Sidebar focus: plan".to_string());
+                    app.set_sidebar_focus(SidebarFocus::Work);
+                    app.status_message = Some("Sidebar focus: work".to_string());
                     continue;
                 }
                 KeyCode::Char('@') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    app.set_sidebar_focus(SidebarFocus::Todos);
-                    app.status_message = Some("Sidebar focus: todos".to_string());
-                    continue;
-                }
-                KeyCode::Char('#') if key.modifiers.contains(KeyModifiers::ALT) => {
                     app.set_sidebar_focus(SidebarFocus::Tasks);
                     app.status_message = Some("Sidebar focus: tasks".to_string());
                     continue;
                 }
-                KeyCode::Char('$') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char('#') if key.modifiers.contains(KeyModifiers::ALT) => {
                     app.set_sidebar_focus(SidebarFocus::Agents);
                     app.status_message = Some("Sidebar focus: agents".to_string());
                     continue;
                 }
-                KeyCode::Char('%') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyCode::Char('$') | KeyCode::Char('%')
+                    if key.modifiers.contains(KeyModifiers::ALT) =>
+                {
                     app.set_sidebar_focus(SidebarFocus::Context);
                     app.status_message = Some("Sidebar focus: context".to_string());
                     continue;
@@ -2851,6 +2879,49 @@ async fn run_event_loop(
                         app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
                     }
                     continue;
+                }
+                // Shift+Enter steers a running turn. When idle, the
+                // normal composer-newline branch below still handles it
+                // as a multiline input gesture.
+                KeyCode::Enter
+                    if app.is_loading
+                        && key.modifiers.contains(KeyModifiers::SHIFT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(input) = app.submit_input() {
+                        if input.starts_with('/') {
+                            if execute_command_input(
+                                terminal,
+                                app,
+                                &mut engine_handle,
+                                &task_manager,
+                                config,
+                                &mut web_config_session,
+                                &input,
+                            )
+                            .await?
+                            {
+                                return Ok(());
+                            }
+                        } else {
+                            let queued = if let Some(mut draft) = app.queued_draft.take() {
+                                draft.display = input;
+                                draft
+                            } else {
+                                build_queued_message(app, input)
+                            };
+                            if let Err(err) =
+                                steer_user_message(app, &engine_handle, queued.clone()).await
+                            {
+                                app.queue_message(queued);
+                                app.status_message = Some(format!(
+                                    "Steer failed ({err}); queued {} message(s)",
+                                    app.queued_message_count()
+                                ));
+                            }
+                        }
+                    }
                 }
                 // Input handling
                 _ if is_composer_newline_key(key) => {
@@ -4079,7 +4150,7 @@ fn handle_composer_history_arrow(
     match key.code {
         KeyCode::Up => {
             if scroll_on_empty {
-                app.scroll_up(1);
+                app.scroll_up(COMPOSER_ARROW_SCROLL_LINES);
             } else {
                 app.history_up();
             }
@@ -4087,7 +4158,7 @@ fn handle_composer_history_arrow(
         }
         KeyCode::Down => {
             if scroll_on_empty {
-                app.scroll_down(1);
+                app.scroll_down(COMPOSER_ARROW_SCROLL_LINES);
             } else {
                 app.history_down();
             }
@@ -5107,22 +5178,6 @@ async fn apply_command_result(
             AppAction::SendMessage(content) => {
                 let queued = build_queued_message(app, content);
                 submit_or_steer_message(app, config, engine_handle, queued).await?;
-            }
-            AppAction::Rlm {
-                prompt,
-                model,
-                child_model,
-                max_depth,
-            } => {
-                app.status_message = Some("RLM turn starting...".to_string());
-                let _ = engine_handle
-                    .send(Op::Rlm {
-                        content: prompt,
-                        model,
-                        child_model,
-                        max_depth,
-                    })
-                    .await;
             }
             AppAction::ListSubAgents => {
                 let _ = engine_handle.send(Op::ListSubAgents).await;
@@ -6210,10 +6265,6 @@ fn draw_app_frame_inner(
     }
     let _ = terminal.backend_mut().flush();
     result
-}
-
-fn draw_app_frame(terminal: &mut AppTerminal, app: &mut App) -> Result<()> {
-    draw_app_frame_inner(terminal, app, false)
 }
 
 /// Pull the latest snapshot of cells / revisions / render options into the
@@ -7674,7 +7725,7 @@ fn collect_active_tool_status(cell: &HistoryCell, snapshot: &mut ActiveToolStatu
             // status. RLM is different today: it is a foreground tool call,
             // so keep it in the live tool footer until the async RLM
             // workbench lands (#513).
-            if generic.name == "agent_spawn" {
+            if matches!(generic.name.as_str(), "agent_open" | "agent_spawn") {
                 return;
             }
             snapshot.record(format!("tool {}", generic.name), generic.status, None);
@@ -8367,6 +8418,21 @@ pub(crate) fn truncate_line_to_width(text: &str, max_width: usize) -> String {
     out
 }
 
+fn should_drop_loading_mouse_motion(app: &App, mouse: MouseEvent) -> bool {
+    if !app.is_loading {
+        return false;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Moved => true,
+        MouseEventKind::Drag(_) => {
+            !app.viewport.transcript_selection.dragging
+                && !app.viewport.transcript_scrollbar_dragging
+        }
+        _ => false,
+    }
+}
+
 fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEvent> {
     if app.view_stack.top_kind() == Some(ModalKind::ContextMenu) {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) {
@@ -8385,7 +8451,10 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEvent> {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             let update = app.viewport.mouse_scroll.on_scroll(ScrollDirection::Up);
-            app.viewport.pending_scroll_delta += update.delta_lines;
+            app.viewport.pending_scroll_delta = app
+                .viewport
+                .pending_scroll_delta
+                .saturating_add(update.delta_lines);
             if update.delta_lines != 0 {
                 app.user_scrolled_during_stream = true;
                 app.needs_redraw = true;
@@ -8393,7 +8462,10 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEvent> {
         }
         MouseEventKind::ScrollDown => {
             let update = app.viewport.mouse_scroll.on_scroll(ScrollDirection::Down);
-            app.viewport.pending_scroll_delta += update.delta_lines;
+            app.viewport.pending_scroll_delta = app
+                .viewport
+                .pending_scroll_delta
+                .saturating_add(update.delta_lines);
             if update.delta_lines != 0 {
                 app.user_scrolled_during_stream = true;
                 app.needs_redraw = true;
@@ -8989,21 +9061,68 @@ fn open_pager_for_last_message(app: &mut App) -> bool {
     true
 }
 
-/// Open a pager showing the full thinking block. Targets the cell at the
-/// current selection if it's a Thinking cell; otherwise falls back to the
-/// most recent Thinking cell across the virtual transcript (history +
-/// in-flight `active_cell`). Bound to Ctrl+O so users can read reasoning
-/// content that's been collapsed in calm-mode rendering.
-///
-/// The virtual-index lookup matters: after `ThinkingComplete` fires the
-/// finalized thinking entry sits in `active_cell` with `streaming = false`
-/// until the active cell flushes to history. During that window the
-/// transcript already renders the "thinking collapsed; press Ctrl+O for
-/// full text" affordance, so the handler must address active-cell entries
-/// or the affordance becomes a lie.
+/// Compatibility wrapper for the old test name. The user-facing Ctrl+O
+/// surface is now Activity Detail, not a thinking-only pager.
+#[cfg(test)]
 fn open_thinking_pager(app: &mut App) -> bool {
-    let selected_cell = app
+    open_activity_detail_pager(app)
+}
+
+/// Open a pager for the activity the user is most likely asking about.
+///
+/// Ctrl+O uses this path. It prefers an explicitly selected activity cell,
+/// then a live activity in the current turn, then the most recent meaningful
+/// activity across history + active cells. Tool activity is intentionally
+/// rendered through the compact live view so Activity Detail does not become
+/// an accidental raw-output dump; Alt+V remains the direct full tool-detail
+/// surface.
+fn open_activity_detail_pager(app: &mut App) -> bool {
+    let Some(idx) = activity_target_cell_index(app) else {
+        app.status_message = Some("No activity detail available".to_string());
+        return true;
+    };
+
+    let width = app
         .viewport
+        .last_transcript_area
+        .map(|area| area.width)
+        .unwrap_or(80);
+    let Some(text) = activity_detail_text(app, idx, width) else {
+        app.status_message = Some("No activity detail available".to_string());
+        return true;
+    };
+    let title = if matches!(
+        app.cell_at_virtual_index(idx),
+        Some(HistoryCell::Thinking { .. })
+    ) {
+        "Reasoning Timeline"
+    } else {
+        "Activity Detail"
+    };
+    app.view_stack
+        .push(PagerView::from_text(title, &text, width.saturating_sub(2)));
+    true
+}
+
+fn activity_target_cell_index(app: &App) -> Option<usize> {
+    if let Some(selected) = selected_transcript_cell_index(app)
+        && app
+            .cell_at_virtual_index(selected)
+            .is_some_and(is_meaningful_activity_cell)
+    {
+        return Some(selected);
+    }
+
+    current_activity_cell_index(app).or_else(|| {
+        (0..app.virtual_cell_count()).rev().find(|&idx| {
+            app.cell_at_virtual_index(idx)
+                .is_some_and(is_meaningful_activity_cell)
+        })
+    })
+}
+
+fn selected_transcript_cell_index(app: &App) -> Option<usize> {
+    app.viewport
         .transcript_selection
         .ordered_endpoints()
         .and_then(|(start, _)| {
@@ -9014,45 +9133,315 @@ fn open_thinking_pager(app: &mut App) -> bool {
                 .and_then(|meta| meta.cell_line())
                 .map(|(cell_index, _)| cell_index)
         })
+}
+
+fn current_activity_cell_index(app: &App) -> Option<usize> {
+    let active = app.active_cell.as_ref()?;
+    let base = app.history.len();
+    for desired_rank in [0, 1, 2] {
+        if let Some((entry_idx, _)) = active
+            .entries()
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, cell)| activity_cell_rank(cell) == Some(desired_rank))
+        {
+            return Some(base + entry_idx);
+        }
+    }
+    None
+}
+
+fn is_meaningful_activity_cell(cell: &HistoryCell) -> bool {
+    activity_cell_rank(cell).is_some()
+}
+
+fn activity_cell_rank(cell: &HistoryCell) -> Option<u8> {
+    match cell {
+        HistoryCell::Thinking {
+            streaming: true, ..
+        } => Some(0),
+        HistoryCell::Tool(tool) => match tool_status_for_activity(tool) {
+            Some(ToolStatus::Running) => Some(0),
+            Some(ToolStatus::Failed) => Some(1),
+            Some(ToolStatus::Success) => Some(2),
+            None => Some(2),
+        },
+        HistoryCell::SubAgent(_) => Some(0),
+        HistoryCell::Error { .. } => Some(1),
+        HistoryCell::Thinking { .. } => Some(2),
+        _ => None,
+    }
+}
+
+fn activity_detail_text(app: &App, cell_index: usize, width: u16) -> Option<String> {
+    let cell = app.cell_at_virtual_index(cell_index)?;
+    if matches!(cell, HistoryCell::Thinking { .. }) {
+        return reasoning_timeline_text(app, cell_index);
+    }
+
+    let mut sections = Vec::new();
+
+    if let Some(turn_id) = app.runtime_turn_id.as_ref() {
+        let status = app.runtime_turn_status.as_deref().unwrap_or("in progress");
+        sections.push(format!(
+            "Turn: {} ({status})",
+            truncate_line_to_width(turn_id, 24)
+        ));
+    }
+
+    sections.push(format!(
+        "Activity: {}",
+        activity_cell_label(app, cell_index, cell)
+    ));
+
+    if let Some(status) = activity_status_line(cell) {
+        sections.push(status);
+    }
+
+    if let Some((position, total)) = thinking_chunk_position(app, cell_index) {
+        sections.push(format!("Thinking chunk: {position} of {total}"));
+    }
+
+    sections.push(String::new());
+    sections.push(activity_cell_to_text(cell, width));
+    Some(sections.join("\n"))
+}
+
+fn reasoning_timeline_text(app: &App, selected_cell_index: usize) -> Option<String> {
+    let thinking_indices: Vec<usize> = (0..app.virtual_cell_count())
         .filter(|&idx| {
             matches!(
                 app.cell_at_virtual_index(idx),
-                Some(crate::tui::history::HistoryCell::Thinking { .. })
-            )
-        });
-
-    let target_idx = selected_cell.or_else(|| {
-        (0..app.virtual_cell_count()).rev().find(|&idx| {
-            matches!(
-                app.cell_at_virtual_index(idx),
-                Some(crate::tui::history::HistoryCell::Thinking { .. })
+                Some(HistoryCell::Thinking { .. })
             )
         })
+        .collect();
+    if thinking_indices.is_empty() {
+        return None;
+    }
+
+    let selected_position = thinking_indices
+        .iter()
+        .position(|&idx| idx == selected_cell_index)
+        .map(|idx| idx + 1);
+    let total = thinking_indices.len();
+    let running = thinking_indices.iter().any(|&idx| {
+        matches!(
+            app.cell_at_virtual_index(idx),
+            Some(HistoryCell::Thinking {
+                streaming: true,
+                ..
+            })
+        )
     });
 
-    let Some(idx) = target_idx else {
-        app.status_message = Some("No thinking blocks to expand".to_string());
-        return true;
-    };
-
-    let width = app
-        .viewport
-        .last_transcript_area
-        .map(|area| area.width)
-        .unwrap_or(80);
-    let text = {
-        let Some(cell) = app.cell_at_virtual_index(idx) else {
-            app.status_message = Some("No thinking blocks to expand".to_string());
-            return true;
-        };
-        history_cell_to_text(cell, width)
-    };
-    app.view_stack.push(PagerView::from_text(
-        "Thinking",
-        &text,
-        width.saturating_sub(2),
+    let mut sections = Vec::new();
+    if let Some(turn_id) = app.runtime_turn_id.as_ref() {
+        let status = app.runtime_turn_status.as_deref().unwrap_or("in progress");
+        sections.push(format!(
+            "Turn: {} ({status})",
+            truncate_line_to_width(turn_id, 24)
+        ));
+    }
+    sections.push("Activity: reasoning timeline".to_string());
+    sections.push(format!(
+        "Status: {} · {total} chunk{}",
+        if running { "running" } else { "done" },
+        if total == 1 { "" } else { "s" }
     ));
-    true
+    if let Some(position) = selected_position {
+        sections.push(format!("Selected chunk: {position} of {total}"));
+    }
+    sections.push(String::new());
+
+    for (position, cell_index) in thinking_indices.iter().copied().enumerate() {
+        let Some(HistoryCell::Thinking {
+            content,
+            streaming,
+            duration_secs,
+        }) = app.cell_at_virtual_index(cell_index)
+        else {
+            continue;
+        };
+        let position = position + 1;
+        let marker = if Some(position) == selected_position {
+            " (selected)"
+        } else {
+            ""
+        };
+        let mut status = if *streaming {
+            "running".to_string()
+        } else {
+            "done".to_string()
+        };
+        if let Some(duration_secs) = duration_secs {
+            status.push_str(" · ");
+            status.push_str(&format!("{duration_secs:.1}s"));
+        }
+        sections.push(format!("Thinking chunk {position} of {total}{marker}"));
+        sections.push(format!("Status: {status}"));
+        let body = content.trim();
+        if body.is_empty() {
+            sections.push("(no reasoning text recorded)".to_string());
+        } else {
+            sections.push(body.to_string());
+        }
+        sections.push(String::new());
+    }
+
+    Some(sections.join("\n"))
+}
+
+fn activity_cell_label(app: &App, cell_index: usize, cell: &HistoryCell) -> String {
+    match cell {
+        HistoryCell::Thinking { .. } => "thinking".to_string(),
+        HistoryCell::Error { .. } => "error".to_string(),
+        HistoryCell::SubAgent(_) => "sub-agent".to_string(),
+        HistoryCell::Tool(_) => {
+            detail_target_label(app, cell_index).unwrap_or_else(|| "tool activity".to_string())
+        }
+        _ => "message".to_string(),
+    }
+}
+
+fn activity_status_line(cell: &HistoryCell) -> Option<String> {
+    match cell {
+        HistoryCell::Thinking {
+            streaming,
+            duration_secs,
+            ..
+        } => {
+            let mut line = if *streaming {
+                "Status: running".to_string()
+            } else {
+                "Status: done".to_string()
+            };
+            if let Some(duration_secs) = duration_secs {
+                line.push_str(" · ");
+                line.push_str(&format!("{duration_secs:.1}s"));
+            }
+            Some(line)
+        }
+        HistoryCell::Tool(tool) => {
+            let status = tool_status_for_activity(tool)?;
+            let mut line = format!("Status: {}", activity_status_label(status));
+            if let Some(duration_ms) = tool_duration_for_activity(tool) {
+                line.push_str(" · ");
+                line.push_str(&format_activity_duration_ms(duration_ms));
+            }
+            Some(line)
+        }
+        HistoryCell::Error { severity, .. } => Some(format!("Status: {:?}", severity)),
+        HistoryCell::SubAgent(_) => None,
+        _ => None,
+    }
+}
+
+fn tool_status_for_activity(tool: &ToolCell) -> Option<ToolStatus> {
+    match tool {
+        ToolCell::Exec(cell) => Some(cell.status),
+        ToolCell::Exploring(cell) => {
+            if cell
+                .entries
+                .iter()
+                .any(|entry| entry.status == ToolStatus::Running)
+            {
+                Some(ToolStatus::Running)
+            } else if cell
+                .entries
+                .iter()
+                .any(|entry| entry.status == ToolStatus::Failed)
+            {
+                Some(ToolStatus::Failed)
+            } else {
+                Some(ToolStatus::Success)
+            }
+        }
+        ToolCell::PlanUpdate(cell) => Some(cell.status),
+        ToolCell::PatchSummary(cell) => Some(cell.status),
+        ToolCell::Review(cell) => Some(cell.status),
+        ToolCell::DiffPreview(_) => Some(ToolStatus::Success),
+        ToolCell::Mcp(cell) => Some(cell.status),
+        ToolCell::ViewImage(_) => Some(ToolStatus::Success),
+        ToolCell::WebSearch(cell) => Some(cell.status),
+        ToolCell::Generic(cell) => Some(cell.status),
+    }
+}
+
+fn tool_duration_for_activity(tool: &ToolCell) -> Option<u64> {
+    match tool {
+        ToolCell::Exec(cell) => cell.duration_ms.or_else(|| {
+            (cell.status == ToolStatus::Running).then(|| {
+                u64::try_from(
+                    cell.started_at
+                        .map(|started| started.elapsed().as_millis())
+                        .unwrap_or_default(),
+                )
+                .unwrap_or(u64::MAX)
+            })
+        }),
+        _ => None,
+    }
+}
+
+fn activity_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Running => "running",
+        ToolStatus::Success => "done",
+        ToolStatus::Failed => "failed",
+    }
+}
+
+fn format_activity_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+fn thinking_chunk_position(app: &App, cell_index: usize) -> Option<(usize, usize)> {
+    if !matches!(
+        app.cell_at_virtual_index(cell_index),
+        Some(HistoryCell::Thinking { .. })
+    ) {
+        return None;
+    }
+
+    let mut total = 0usize;
+    let mut position = None;
+    for idx in 0..app.virtual_cell_count() {
+        if matches!(
+            app.cell_at_virtual_index(idx),
+            Some(HistoryCell::Thinking { .. })
+        ) {
+            total += 1;
+            if idx == cell_index {
+                position = Some(total);
+            }
+        }
+    }
+    position.map(|pos| (pos, total))
+}
+
+fn activity_cell_to_text(cell: &HistoryCell, width: u16) -> String {
+    let lines = match cell {
+        HistoryCell::Tool(_) => cell.lines_with_options(
+            width,
+            TranscriptRenderOptions {
+                calm_mode: true,
+                low_motion: true,
+                ..TranscriptRenderOptions::default()
+            },
+        ),
+        _ => cell.transcript_lines(width),
+    };
+    lines
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn open_tool_details_pager(app: &mut App) -> bool {
@@ -9219,17 +9608,42 @@ fn selected_detail_footer_label(app: &App) -> Option<String> {
     if app.viewport.transcript_selection.is_active() {
         return None;
     }
-    let cell_index = app.detail_cell_index_for_viewport(
-        app.viewport.last_transcript_top,
-        app.viewport.last_transcript_visible.max(1),
-        app.viewport.transcript_cache.line_meta(),
-    )?;
-    let label = detail_target_label(app, cell_index)?;
+    let cell_index = activity_footer_target_cell_index(app)?;
+    let cell = app.cell_at_virtual_index(cell_index)?;
+    let label = truncate_line_to_width(&activity_cell_label(app, cell_index, cell), 30);
+    let raw_hint = if app.cell_has_detail_target(cell_index) {
+        format!(" · {} raw", tool_details_shortcut_label())
+    } else {
+        String::new()
+    };
     Some(format!(
-        "{} details: {}",
-        tool_details_shortcut_label(),
-        truncate_line_to_width(&label, 34)
+        "{} Activity: {label}{raw_hint}",
+        activity_shortcut_label()
     ))
+}
+
+fn activity_footer_target_cell_index(app: &App) -> Option<usize> {
+    let line_meta = app.viewport.transcript_cache.line_meta();
+    let start = app
+        .viewport
+        .last_transcript_top
+        .min(line_meta.len().saturating_sub(1));
+    let end = start
+        .saturating_add(app.viewport.last_transcript_visible.max(1))
+        .min(line_meta.len());
+    for meta in line_meta.iter().take(end).skip(start) {
+        let Some((cell_index, _)) = meta.cell_line() else {
+            continue;
+        };
+        if app
+            .cell_at_virtual_index(cell_index)
+            .is_some_and(is_meaningful_activity_cell)
+        {
+            return Some(cell_index);
+        }
+    }
+
+    activity_target_cell_index(app)
 }
 
 fn detail_target_label(app: &App, cell_index: usize) -> Option<String> {
@@ -9306,6 +9720,10 @@ fn tool_details_shortcut_label() -> &'static str {
     } else {
         "Alt+V"
     }
+}
+
+fn activity_shortcut_label() -> &'static str {
+    "Ctrl+O"
 }
 
 /// Modifier predicate for the v0.8.30 family of `Alt+<letter>` transcript-
