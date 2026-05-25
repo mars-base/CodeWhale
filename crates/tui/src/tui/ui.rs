@@ -1,5 +1,6 @@
 //! TUI event loop and rendering logic for `DeepSeek` CLI.
 
+use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -54,7 +55,7 @@ use crate::session_manager::{
     create_saved_session_with_id_and_mode, create_saved_session_with_mode, update_session,
 };
 use crate::task_manager::{
-    NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskStatus,
+    NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskStatus, TaskSummary,
 };
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::subagent::SubAgentStatus;
@@ -104,7 +105,7 @@ use crate::tui::workspace_context;
 
 use super::app::{
     App, AppAction, AppMode, OnboardingState, QueuedMessage, ReasoningEffort, SidebarFocus,
-    StatusToastLevel, SubmitDisposition, TaskPanelEntry, TuiOptions,
+    StatusToastLevel, SubmitDisposition, TaskPanelEntry, TuiOptions, VoiceInputState,
     looks_like_slash_command_input,
 };
 use super::approval::{
@@ -115,7 +116,8 @@ use super::history::{
     summarize_tool_output,
 };
 use super::slash_menu::{
-    apply_slash_menu_selection, try_autocomplete_slash_command, visible_slash_menu_entries,
+    apply_slash_menu_selection, partial_inline_skill_mention_at_cursor,
+    try_autocomplete_slash_command, visible_slash_menu_entries,
 };
 use super::views::{ConfigView, HelpView, ModalKind, ShellControlView, ViewEvent};
 use super::widgets::pending_input_preview::{ContextPreviewItem, PendingInputPreview};
@@ -189,6 +191,11 @@ enum TranslationEvent {
         translated: anyhow::Result<String>,
     },
 }
+
+#[derive(Debug)]
+enum VoiceInputEvent {
+    Finished { result: Result<String> },
+}
 // Reset scroll region (`\x1b[r`), origin mode (`\x1b[?6l`), and home the cursor
 // (`\x1b[H`) before letting ratatui's diff renderer repaint. The destructive
 // `\x1b[2J\x1b[3J` pair was previously appended here to also wipe the visible
@@ -253,7 +260,7 @@ pub async fn run_tui(config: &Config, options: TuiOptions) -> Result<()> {
     // Terminal probe with timeout to prevent hanging on unresponsive terminals
     let probe_timeout = terminal_probe_timeout(config);
     let enable_raw = tokio::task::spawn_blocking(move || {
-        enable_raw_mode().map_err(|e| anyhow::anyhow!("Failed to enable raw mode: {}", e))
+        enable_raw_mode().map_err(|e| anyhow::anyhow!("Failed to enable raw mode: {e}"))
     });
 
     match tokio::time::timeout(probe_timeout, enable_raw).await {
@@ -576,7 +583,7 @@ fn should_show_resume_hint(session_id: Option<&str>) -> bool {
 }
 
 fn resume_hint_text() -> &'static str {
-    "To continue this session, execute deepseek run --continue"
+    "To continue this session, execute codewhale run --continue"
 }
 
 fn terminal_probe_timeout(config: &Config) -> Duration {
@@ -724,13 +731,69 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
     }
 }
 
+/// How long after a task finishes it should still appear in the Work
+/// sidebar even if its `ended_at` predates the current TUI session.
+///
+/// Tasks completing during the current session always show (until the
+/// next session boundary). Tasks that completed shortly before the
+/// session also show, so users coming back to a terminal see "you just
+/// finished X". Anything older than this window is hidden — preventing
+/// the sidebar from accumulating indefinitely (bug #1913).
+const WORK_SIDEBAR_RECENT_COMPLETED_TTL: chrono::Duration = chrono::Duration::hours(2);
+
+/// Choose which durable-task summaries should appear in the Work
+/// sidebar's Tasks panel.
+///
+/// Active tasks (`Queued`/`Running`) are always included. Terminal
+/// tasks (`Completed`/`Failed`/`Canceled`) are kept only if their
+/// `ended_at` falls within the "recent" window — defined as either:
+///
+/// - within the current TUI session (`ended_at >= session_started_at`), or
+/// - within `recent_ttl` of `now` (so a task that finished a few
+///   minutes before the session started still shows).
+///
+/// Anything older than that — including the multi-day-old completed
+/// tasks reported in bug #1913 — is excluded so the sidebar does not
+/// accumulate indefinitely across sessions.
+///
+/// A terminal task missing `ended_at` is treated as not-recent and
+/// dropped: durable tasks always stamp `ended_at` when they reach a
+/// terminal state, so absence of it indicates a record from a much
+/// older schema and isn't worth surfacing.
+pub(crate) fn select_work_sidebar_tasks(
+    tasks: Vec<TaskSummary>,
+    session_started_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+    recent_ttl: chrono::Duration,
+) -> Vec<TaskSummary> {
+    let recent_cutoff = now - recent_ttl;
+    tasks
+        .into_iter()
+        .filter(|task| match task.status {
+            TaskStatus::Queued | TaskStatus::Running => true,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Canceled => {
+                match task.ended_at {
+                    Some(ended_at) => ended_at >= session_started_at || ended_at >= recent_cutoff,
+                    None => false,
+                }
+            }
+        })
+        .collect()
+}
+
 async fn refresh_active_task_panel(app: &mut App, task_manager: &SharedTaskManager) {
     let tasks = task_manager.list_tasks(None).await;
-    let mut entries: Vec<TaskPanelEntry> = tasks
-        .into_iter()
-        .filter(|task| matches!(task.status, TaskStatus::Queued | TaskStatus::Running))
-        .map(task_summary_to_panel_entry)
-        .collect();
+    let session_started_at = app.session_started_at;
+    let now = chrono::Utc::now();
+    let mut entries: Vec<TaskPanelEntry> = select_work_sidebar_tasks(
+        tasks,
+        session_started_at,
+        now,
+        WORK_SIDEBAR_RECENT_COMPLETED_TTL,
+    )
+    .into_iter()
+    .map(task_summary_to_panel_entry)
+    .collect();
 
     entries.extend(active_rlm_task_entries(app));
 
@@ -804,6 +867,8 @@ async fn run_event_loop(
     let mut current_streaming_text = String::new();
     let (translation_tx, mut translation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TranslationEvent>();
+    let (voice_input_tx, mut voice_input_rx) =
+        tokio::sync::mpsc::unbounded_channel::<VoiceInputEvent>();
     let mut pending_translations = 0usize;
     let mut pending_thinking_translations = 0usize;
     let mut last_queue_state = (app.queued_messages.clone(), app.queued_draft.clone());
@@ -922,6 +987,8 @@ async fn run_event_loop(
                 }
             }
         }
+
+        drain_voice_input_events(app, &mut voice_input_rx);
 
         if last_task_refresh.elapsed() >= Duration::from_millis(2500) {
             refresh_active_task_panel(app, &task_manager).await;
@@ -1239,6 +1306,9 @@ async fn run_event_loop(
                                 | "agent_close"
                                 | "agent_cancel"
                                 | "todo_write"
+                                | "checklist_write"
+                                | "checklist_update"
+                                | "update_plan"
                                 | "task_shell_start"
                                 | "exec_shell"
                         ) {
@@ -1424,6 +1494,24 @@ async fn run_event_loop(
                             );
                         }
 
+                        // Generate post-turn receipt for completed turns.
+                        if status == crate::core::events::TurnOutcomeStatus::Completed {
+                            let tool_count = app.tool_evidence.len();
+                            let mut receipt = "✓ turn completed".to_string();
+                            if tool_count > 0 {
+                                let _ = write!(receipt, " · {tool_count} tool(s) used");
+                                for evidence in &app.tool_evidence {
+                                    let summary = crate::utils::truncate_with_ellipsis(
+                                        &evidence.summary,
+                                        60,
+                                        "…",
+                                    );
+                                    let _ = write!(receipt, " · {}: {summary}", evidence.tool_name);
+                                }
+                            }
+                            app.set_receipt_text(receipt);
+                        }
+
                         // Auto-save completed turn and clear crash checkpoint.
                         // Offloaded to the persistence actor so the UI
                         // stays responsive.
@@ -1445,7 +1533,8 @@ async fn run_event_loop(
                                 content: plan_next_step_prompt(),
                             });
                             if app.view_stack.top_kind() != Some(ModalKind::PlanPrompt) {
-                                app.view_stack.push(PlanPromptView::new());
+                                let plan = Some(app.plan_state.lock().await.snapshot());
+                                app.view_stack.push(PlanPromptView::new(plan));
                             }
                         }
                         app.plan_tool_used_in_turn = false;
@@ -1915,6 +2004,7 @@ async fn run_event_loop(
                 &task_manager,
                 &mut engine_handle,
                 &mut web_config_session,
+                voice_input_tx.clone(),
                 events,
             )
             .await?
@@ -1927,7 +2017,10 @@ async fn run_event_loop(
         if reconcile_turn_liveness(app, Instant::now(), has_running_agents) {
             app.needs_redraw = true;
         }
-        if (app.is_loading || has_running_agents || app.is_compacting)
+        if (app.is_loading
+            || has_running_agents
+            || app.is_compacting
+            || app.voice_input_state.is_some())
             && last_status_frame.elapsed()
                 >= Duration::from_millis(status_animation_interval_ms(app))
         {
@@ -1983,6 +2076,7 @@ async fn run_event_loop(
         // Expire the "Press Ctrl+C again to quit" prompt silently after its
         // window. Triggers a redraw if the prompt was visible.
         app.tick_quit_armed();
+        app.tick_receipt();
         // While the user is drag-selecting past the transcript edge, advance
         // the viewport on a fixed cadence and extend the selection head so a
         // long passage can be selected in one drag (#1163).
@@ -2020,7 +2114,11 @@ async fn run_event_loop(
             app.needs_redraw = false;
         }
 
-        let mut poll_timeout = if app.is_loading || has_running_agents || app.is_compacting {
+        let mut poll_timeout = if app.is_loading
+            || has_running_agents
+            || app.is_compacting
+            || app.voice_input_state.is_some()
+        {
             Duration::from_millis(active_poll_ms(app))
         } else {
             Duration::from_millis(idle_poll_ms(app))
@@ -2205,6 +2303,7 @@ async fn run_event_loop(
                     &task_manager,
                     &mut engine_handle,
                     &mut web_config_session,
+                    voice_input_tx.clone(),
                     events,
                 )
                 .await?
@@ -2219,6 +2318,51 @@ async fn run_event_loop(
             };
 
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            // Decision card keyboard routing (v0.8.43 truth-surface).
+            // When a card is active, number keys 1-9 select options,
+            // j/k or Up/Down navigate, and Enter confirms.
+            // Only route keys to the decision card when no other modal
+            // (Help, Config, Pager, etc.) is on top of the view stack (#2005).
+            if app.view_stack.is_empty()
+                && let Some(card) = app.decision_card.as_mut()
+            {
+                match key.code {
+                    KeyCode::Char(c @ '1'..='9') => {
+                        let n = (c as u8 - b'1' + 1) as usize;
+                        card.select_number(n);
+                        card.confirm();
+                        app.status_message = card
+                            .confirmed_label()
+                            .map(|label| format!("Selected: {label}"));
+                        app.decision_card = None;
+                        app.needs_redraw = true;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        card.select_next();
+                        app.needs_redraw = true;
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        card.select_prev();
+                        app.needs_redraw = true;
+                    }
+                    KeyCode::Enter => {
+                        card.confirm();
+                        app.status_message = card
+                            .confirmed_label()
+                            .map(|label| format!("Selected: {label}"));
+                        app.decision_card = None;
+                        app.needs_redraw = true;
+                    }
+                    KeyCode::Esc => {
+                        app.decision_card = None;
+                        app.status_message = Some("Decision cancelled".to_string());
+                        app.needs_redraw = true;
+                    }
+                    _ => {}
+                }
                 continue;
             }
 
@@ -2428,7 +2572,7 @@ async fn run_event_loop(
                     app.input = "/jobs cancel-all".to_string();
                     app.cursor_position = app.input.len();
                     app.status_message =
-                        Some("Press Enter to kill all running shell jobs".to_string());
+                        Some("Press Enter to cancel all running commands".to_string());
                     continue;
                 }
                 // When the composer is the active input target (no modal/pager
@@ -2447,6 +2591,38 @@ async fn run_event_loop(
                         app.mcp_snapshot.as_ref(),
                     )));
                 continue;
+            }
+
+            // y / Y in the Tasks sidebar: yank the current turn id (y)
+            // or copy full task detail (Y) to the system clipboard.
+            // Only active when the composer is empty to avoid stealing
+            // keystrokes from typed input (#2000).
+            if app.view_stack.is_empty()
+                && app.sidebar_focus == SidebarFocus::Tasks
+                && app.input.is_empty()
+                && !app.runtime_turn_id.as_deref().unwrap_or("").is_empty()
+            {
+                if key.code == KeyCode::Char('y') && key.modifiers == KeyModifiers::NONE {
+                    if let Some(turn_id) = app.runtime_turn_id.as_ref()
+                        && app.clipboard.write_text(turn_id).is_ok()
+                    {
+                        app.status_message = Some(format!("Copied turn id {turn_id}"));
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::Char('Y') && key.modifiers == KeyModifiers::NONE {
+                    let mut detail = String::new();
+                    if let Some(turn_id) = app.runtime_turn_id.as_ref() {
+                        let _ = write!(detail, "turn {turn_id}");
+                    }
+                    if let Some(status) = app.runtime_turn_status.as_deref() {
+                        let _ = write!(detail, "  status={status}");
+                    }
+                    if !detail.is_empty() && app.clipboard.write_text(&detail).is_ok() {
+                        app.status_message = Some(format!("Copied {detail}"));
+                    }
+                    continue;
+                }
             }
 
             // Shifted shortcuts toggle the file-tree pane. Keep plain Ctrl+E
@@ -2509,6 +2685,7 @@ async fn run_event_loop(
                     &task_manager,
                     &mut engine_handle,
                     &mut web_config_session,
+                    voice_input_tx.clone(),
                     events,
                 )
                 .await?
@@ -2521,7 +2698,7 @@ async fn run_event_loop(
             // File-tree navigation: intercept keys when the file-tree pane is
             // visible so Up/Down/Enter/Esc operate on the tree rather than
             // falling through to composer or modal handlers.
-            if app.file_tree.is_some() {
+            if app.file_tree_visible {
                 match key.code {
                     KeyCode::Up => {
                         if let Some(state) = app.file_tree.as_mut() {
@@ -2543,7 +2720,7 @@ async fn run_event_loop(
                                 // Insert @path into the composer.
                                 let path_str = rel_path.to_string_lossy().to_string();
                                 app.status_message = Some(format!("Attached @{path_str}"));
-                                app.insert_str(&format!("@{} ", path_str));
+                                app.insert_str(&format!("@{path_str} "));
                             } else {
                                 // Directory was expanded/collapsed; rebuild.
                                 app.needs_redraw = true;
@@ -2654,6 +2831,24 @@ async fn run_event_loop(
                         && app.input.is_empty()
                         && open_activity_detail_pager(app) =>
                 {
+                    continue;
+                }
+                // Space toggles collapse/expand of the focused thinking block
+                // when the composer is empty (#1972).
+                KeyCode::Char(' ')
+                    if key.modifiers == KeyModifiers::NONE && app.input.is_empty() =>
+                {
+                    if let Some(idx) = detail_target_cell_index(app) {
+                        if app.collapsed_cells.contains(&idx) {
+                            app.collapsed_cells.remove(&idx);
+                            app.status_message = Some("Thinking block expanded".to_string());
+                        } else {
+                            app.collapsed_cells.insert(idx);
+                            app.status_message = Some("Thinking block collapsed".to_string());
+                        }
+                        app.mark_history_updated();
+                        app.needs_redraw = true;
+                    }
                     continue;
                 }
                 KeyCode::Char('t') | KeyCode::Char('T')
@@ -2971,9 +3166,7 @@ async fn run_event_loop(
                 // hijacked for navigation — typing "good" yielded "ood" with
                 // no whale and no warning. The Alt-prefixed shortcuts mirror
                 // the Alt+R / Alt+V / Alt+C pattern already in use. Shift is
-                // permitted so capital-letter forms (e.g. `Alt+Shift+G` for
-                // bottom) work; Ctrl/Super are blocked so the bindings don't
-                // collide with platform clipboard / window shortcuts.
+                // permitted for most capital-letter forms.
                 KeyCode::Char('g')
                     if key_shortcuts::alt_nav_modifiers(key.modifiers)
                         && app.input.is_empty()
@@ -3130,12 +3323,17 @@ async fn run_event_loop(
                     // sending the literal `/mo` text. Only kick in when the
                     // popup has at least one entry; otherwise fall through
                     // to the legacy submit path.
+                    let selecting_inline_skill = slash_menu_open
+                        && partial_inline_skill_mention_at_cursor(&app.input, app.cursor_position)
+                            .is_some();
                     if slash_menu_open
                         && !slash_menu_entries.is_empty()
-                        && looks_like_slash_command_input(&app.input)
                         && apply_slash_menu_selection(app, &slash_menu_entries, false)
                     {
                         app.close_slash_menu();
+                        if selecting_inline_skill {
+                            continue;
+                        }
                     }
                     if let Some(input) = app.handle_composer_enter() {
                         if handle_plan_choice(app, config, &engine_handle, &input).await? {
@@ -3333,6 +3531,12 @@ async fn run_event_loop(
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.clear_input_recoverable();
                 }
+                KeyCode::Char('z')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && app.restore_last_cleared_input_if_empty() =>
+                {
+                    app.status_message = Some("Restored cleared draft".to_string());
+                }
                 KeyCode::Char('w') | KeyCode::Char('W')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
@@ -3377,7 +3581,8 @@ async fn run_event_loop(
                 KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let new_mode = match app.mode {
                         AppMode::Plan => AppMode::Agent,
-                        _ => AppMode::Plan,
+                        AppMode::Agent => AppMode::Yolo,
+                        AppMode::Yolo => AppMode::Plan,
                     };
                     app.set_mode(new_mode);
                 }
@@ -3628,7 +3833,14 @@ pub(crate) fn apply_engine_error_to_app(
     let recoverable = envelope.recoverable;
     let message = envelope.message.clone();
     let severity = envelope.severity;
+    let turn_was_in_progress =
+        app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"));
     streaming_thinking::finalize_current(app);
+    if turn_was_in_progress {
+        app.finalize_streaming_assistant_as_interrupted();
+        app.finalize_active_cell_as_interrupted();
+        app.runtime_turn_status = Some("failed".to_string());
+    }
     app.streaming_state.reset();
     app.streaming_message_index = None;
     app.streaming_thinking_active_entry = None;
@@ -3675,22 +3887,23 @@ pub(crate) fn apply_engine_error_to_app(
 }
 
 fn persist_offline_queue_state(app: &App) {
-    if let Ok(manager) = SessionManager::default_location() {
-        if app.queued_messages.is_empty() && app.queued_draft.is_none() {
-            let _ = manager.clear_offline_queue_state();
-            return;
-        }
-        let state = OfflineQueueState {
-            messages: app
-                .queued_messages
-                .iter()
-                .map(queued_ui_to_session)
-                .collect(),
-            draft: app.queued_draft.as_ref().map(queued_ui_to_session),
-            ..OfflineQueueState::default()
-        };
-        let _ = manager.save_offline_queue_state(&state, app.current_session_id.as_deref());
+    if app.queued_messages.is_empty() && app.queued_draft.is_none() {
+        persistence_actor::persist(PersistRequest::ClearOfflineQueue);
+        return;
     }
+    let state = OfflineQueueState {
+        messages: app
+            .queued_messages
+            .iter()
+            .map(queued_ui_to_session)
+            .collect(),
+        draft: app.queued_draft.as_ref().map(queued_ui_to_session),
+        ..OfflineQueueState::default()
+    };
+    persistence_actor::persist(PersistRequest::OfflineQueue {
+        state,
+        session_id: app.current_session_id.clone(),
+    });
 }
 
 /// Strip ANSI control codes / non-printable bytes from a streaming
@@ -3869,6 +4082,9 @@ async fn dispatch_user_message(
     app.runtime_turn_status = None;
     app.last_send_at = Some(dispatch_started_at);
     app.last_submitted_prompt = Some(message.display.clone());
+    // Clear the previous turn's receipt and evidence.
+    app.clear_receipt();
+    app.tool_evidence.clear();
 
     let cwd = std::env::current_dir().ok();
     let references = crate::tui::file_mention::context_references_from_input(
@@ -3891,6 +4107,7 @@ async fn dispatch_user_message(
                 project_context_pack_enabled: config.project_context_pack_enabled(),
                 locale_tag: app.ui_locale.tag(),
                 translation_enabled: app.translation_enabled,
+                model_id: &app.model,
             },
         ),
     );
@@ -4734,19 +4951,18 @@ async fn apply_command_result(
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn open_external_url(url: &str) -> Result<()> {
-    let mut command = external_url_command(url);
+    spawn_external_url_command(external_url_command(url))
+}
 
-    let status = command
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn spawn_external_url_command(mut command: Command) -> Result<()> {
+    command
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map_err(|err| anyhow::anyhow!("failed to launch browser command: {err}"))?;
-    if !status.success() {
-        return Err(anyhow::anyhow!(
-            "browser command exited with status {status}"
-        ));
-    }
-    Ok(())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("failed to launch browser command: {err}"))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -4963,14 +5179,14 @@ fn mcp_ui_action_refreshes_discovery(action: &crate::tui::app::McpUiAction) -> b
 
 fn handle_shell_job_action(app: &mut App, action: crate::tui::app::ShellJobAction) {
     let Some(shell_manager) = app.runtime_services.shell_manager.clone() else {
-        add_shell_job_message(app, "Shell job center is not attached.".to_string());
+        add_shell_job_message(app, "Command center is not attached.".to_string());
         return;
     };
 
     let mut manager = match shell_manager.lock() {
         Ok(manager) => manager,
         Err(_) => {
-            add_shell_job_message(app, "Shell job center lock is poisoned.".to_string());
+            add_shell_job_message(app, "Command center lock is poisoned.".to_string());
             return;
         }
     };
@@ -4982,12 +5198,12 @@ fn handle_shell_job_action(app: &mut App, action: crate::tui::app::ShellJobActio
         }
         crate::tui::app::ShellJobAction::Show { id } => match manager.inspect_job(&id) {
             Ok(detail) => open_shell_job_pager(app, &detail),
-            Err(err) => add_shell_job_message(app, format!("Shell job lookup failed: {err}")),
+            Err(err) => add_shell_job_message(app, format!("Command lookup failed: {err}")),
         },
         crate::tui::app::ShellJobAction::Poll { id, wait } => {
             match manager.poll_delta(&id, wait, if wait { 5_000 } else { 1_000 }) {
                 Ok(delta) => add_shell_job_message(app, format_shell_poll(&delta.result)),
-                Err(err) => add_shell_job_message(app, format!("Shell job poll failed: {err}")),
+                Err(err) => add_shell_job_message(app, format!("Command poll failed: {err}")),
             }
         }
         crate::tui::app::ShellJobAction::SendStdin { id, input, close } => {
@@ -4995,21 +5211,24 @@ fn handle_shell_job_action(app: &mut App, action: crate::tui::app::ShellJobActio
                 Ok(()) => match manager.poll_delta(&id, false, 1_000) {
                     Ok(delta) => add_shell_job_message(app, format_shell_poll(&delta.result)),
                     Err(err) => {
-                        add_shell_job_message(app, format!("Shell stdin sent; poll failed: {err}"));
+                        add_shell_job_message(
+                            app,
+                            format!("Command input sent; poll failed: {err}"),
+                        );
                     }
                 },
-                Err(err) => add_shell_job_message(app, format!("Shell stdin failed: {err}")),
+                Err(err) => add_shell_job_message(app, format!("Command input failed: {err}")),
             }
         }
         crate::tui::app::ShellJobAction::Cancel { id } => match manager.kill(&id) {
             Ok(result) => add_shell_job_message(app, format_shell_poll(&result)),
-            Err(err) => add_shell_job_message(app, format!("Shell job cancel failed: {err}")),
+            Err(err) => add_shell_job_message(app, format!("Command cancel failed: {err}")),
         },
         crate::tui::app::ShellJobAction::CancelAll => match manager.kill_running() {
             Ok(results) => {
                 let count = results.len();
                 if count == 0 {
-                    add_shell_job_message(app, "No running shell jobs to cancel.".to_string());
+                    add_shell_job_message(app, "No running commands to cancel.".to_string());
                 } else {
                     let tasks: Vec<String> = results
                         .iter()
@@ -5017,11 +5236,11 @@ fn handle_shell_job_action(app: &mut App, action: crate::tui::app::ShellJobActio
                         .collect();
                     add_shell_job_message(
                         app,
-                        format!("Killed {count} shell job(s): {}", tasks.join(", ")),
+                        format!("Canceled {count} command(s): {}", tasks.join(", ")),
                     );
                 }
             }
-            Err(err) => add_shell_job_message(app, format!("Shell job cancel-all failed: {err}")),
+            Err(err) => add_shell_job_message(app, format!("Command cancel-all failed: {err}")),
         },
     }
 }
@@ -5067,6 +5286,82 @@ async fn execute_command_input(
         result,
     )
     .await
+}
+
+fn start_voice_input(
+    app: &mut App,
+    voice_input_tx: tokio::sync::mpsc::UnboundedSender<VoiceInputEvent>,
+) {
+    if app.voice_input_state.is_some() {
+        app.status_message = Some("Voice input is already listening".to_string());
+        app.needs_redraw = true;
+        return;
+    }
+
+    let settings = match crate::settings::Settings::load() {
+        Ok(settings) => settings,
+        Err(err) => {
+            app.add_message(HistoryCell::System {
+                content: format!("Voice input unavailable: failed to load settings: {err}"),
+            });
+            app.status_message = Some("Voice input unavailable".to_string());
+            return;
+        }
+    };
+
+    let Some(command_line) = settings.voice_input_command.clone() else {
+        app.add_message(HistoryCell::System {
+            content: "Voice input is not configured. Set `voice_input_command` in settings.toml or export `DEEPSEEK_VOICE_INPUT_COMMAND`. Open the command palette and choose Voice input after configuring it. The command must write the transcript to stdout.".to_string(),
+        });
+        app.status_message = Some("Voice input not configured".to_string());
+        return;
+    };
+
+    let timeout_secs = settings.voice_input_timeout_secs;
+    let workspace = app.workspace.clone();
+    app.voice_input_state = Some(VoiceInputState::new(Instant::now()));
+    app.status_message =
+        Some("Voice input listening - transcript will appear in the composer".to_string());
+    app.needs_redraw = true;
+
+    tokio::spawn(async move {
+        let result = crate::tui::voice_input::run_configured_voice_command(
+            &command_line,
+            timeout_secs,
+            &workspace,
+        )
+        .await;
+        let _ = voice_input_tx.send(VoiceInputEvent::Finished { result });
+    });
+}
+
+fn drain_voice_input_events(
+    app: &mut App,
+    voice_input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<VoiceInputEvent>,
+) {
+    while let Ok(event) = voice_input_rx.try_recv() {
+        match event {
+            VoiceInputEvent::Finished { result } => {
+                app.voice_input_state = None;
+                match result {
+                    Ok(transcript) => {
+                        let char_count = transcript.chars().count();
+                        app.insert_str(&transcript);
+                        app.status_message = Some(format!(
+                            "Voice transcript inserted ({char_count} chars) - edit, then Enter to send"
+                        ));
+                    }
+                    Err(err) => {
+                        app.add_message(HistoryCell::System {
+                            content: format!("Voice input failed: {err}"),
+                        });
+                        app.status_message = Some("Voice input failed".to_string());
+                    }
+                }
+                app.needs_redraw = true;
+            }
+        }
+    }
 }
 
 async fn steer_user_message(
@@ -5139,7 +5434,8 @@ async fn submit_or_steer_message(
             }
             Ok(())
         }
-        // Steer and QueueFollowUp are now only reached via Ctrl+Enter override.
+        // Steer: reached via Enter when busy-but-waiting (v0.8.44), or
+        // via Ctrl+Enter override in any busy state.
         SubmitDisposition::Steer => {
             if let Err(err) = steer_user_message(app, engine_handle, message.clone()).await {
                 app.queue_message(message);
@@ -5483,6 +5779,7 @@ fn render(f: &mut Frame, app: &mut App) {
         // enough, reserve the left ~25% for the file tree.
         let mut chat_area =
             if app.file_tree.is_some() && chunks[1].width >= SIDEBAR_VISIBLE_MIN_WIDTH {
+                app.file_tree_visible = true;
                 let split = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
@@ -5497,6 +5794,7 @@ fn render(f: &mut Frame, app: &mut App) {
 
                 remaining
             } else {
+                app.file_tree_visible = false;
                 chunks[1]
             };
 
@@ -5546,6 +5844,25 @@ fn render(f: &mut Frame, app: &mut App) {
     // surface the older ones as a 1-2 line strip above the footer so a
     // burst of events isn't collapsed to a single visible message.
     render_toast_stack_overlay(f, size, chunks[3], chunks[4], app);
+
+    // Decision card overlay (v0.8.43 truth-surface). When a decision card is
+    // active, render it centered on top of the transcript.
+    if let Some(ref card) = app.decision_card {
+        let card_width = size.width.clamp(30, 60);
+        let card_height = card.desired_height(card_width);
+        let card_area = ratatui::layout::Rect {
+            x: size
+                .x
+                .saturating_add(size.width.saturating_sub(card_width) / 2),
+            y: size
+                .y
+                .saturating_add(size.height.saturating_sub(card_height) / 2),
+            width: card_width,
+            height: card_height.min(size.height),
+        };
+        let buf = f.buffer_mut();
+        card.render(card_area, buf);
+    }
 
     if !app.view_stack.is_empty() {
         // The live transcript overlay snapshots the app's history + active
@@ -5660,6 +5977,7 @@ async fn handle_view_events(
     task_manager: &SharedTaskManager,
     engine_handle: &mut EngineHandle,
     web_config_session: &mut Option<WebConfigSession>,
+    voice_input_tx: tokio::sync::mpsc::UnboundedSender<VoiceInputEvent>,
     events: Vec<ViewEvent>,
 ) -> Result<bool> {
     for event in events {
@@ -5689,6 +6007,9 @@ async fn handle_view_events(
                 }
                 crate::tui::views::CommandPaletteAction::OpenTextPager { title, content } => {
                     open_text_pager(app, title, content);
+                }
+                crate::tui::views::CommandPaletteAction::VoiceInput => {
+                    start_voice_input(app, voice_input_tx.clone());
                 }
             },
             ViewEvent::OpenTextPager { title, content } => {
@@ -6341,6 +6662,9 @@ fn recover_interrupted_user_tail(messages: &[Message]) -> (Vec<Message>, Option<
     let Some(display) = retry_display_from_user_message(last) else {
         return (recovered, None);
     };
+    if looks_like_slash_command_input(&display) {
+        return (recovered, None);
+    }
     recovered.pop();
     (recovered, Some(QueuedMessage::new(display, None)))
 }
@@ -6835,16 +7159,14 @@ fn maybe_warn_context_pressure(app: &mut App) {
 
     if percent >= CONTEXT_CRITICAL_THRESHOLD_PERCENT {
         app.status_message = Some(format!(
-            "Context critical: {:.0}% ({used}/{max} tokens). {recommendation}",
-            percent
+            "Context critical: {percent:.0}% ({used}/{max} tokens). {recommendation}"
         ));
         return;
     }
 
     if app.status_message.is_none() {
         app.status_message = Some(format!(
-            "Context high: {:.0}% ({used}/{max} tokens). {recommendation}",
-            percent
+            "Context high: {percent:.0}% ({used}/{max} tokens). {recommendation}"
         ));
     }
 }
@@ -7215,7 +7537,7 @@ fn activity_status_line(cell: &HistoryCell) -> Option<String> {
             }
             Some(line)
         }
-        HistoryCell::Error { severity, .. } => Some(format!("Status: {:?}", severity)),
+        HistoryCell::Error { severity, .. } => Some(format!("Status: {severity:?}")),
         HistoryCell::SubAgent(_) => None,
         _ => None,
     }
@@ -7494,13 +7816,18 @@ pub(crate) fn selected_detail_footer_label(app: &App) -> Option<String> {
     let cell_index = activity_footer_target_cell_index(app)?;
     let cell = app.cell_at_virtual_index(cell_index)?;
     let label = truncate_line_to_width(&activity_cell_label(app, cell_index, cell), 30);
-    let raw_hint = if app.cell_has_detail_target(cell_index) {
-        format!(" · {} raw", key_shortcuts::tool_details_shortcut_label())
+    let detail_hint = if app.cell_has_detail_target(cell_index) {
+        let noun = if matches!(cell, HistoryCell::SubAgent(_)) {
+            "details"
+        } else {
+            "raw"
+        };
+        format!(" · {} {noun}", key_shortcuts::tool_details_shortcut_label())
     } else {
         String::new()
     };
     Some(format!(
-        "{} Activity: {label}{raw_hint}",
+        "{} Activity: {label}{detail_hint}",
         key_shortcuts::activity_shortcut_label()
     ))
 }

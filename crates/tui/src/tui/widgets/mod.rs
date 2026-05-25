@@ -10,6 +10,7 @@ pub mod key_hint;
 // the composer area in `ui.rs`. `pub mod` (vs the usual `pub use` pattern)
 // keeps the unused-imports lint quiet until then.
 pub mod agent_card;
+pub mod decision_card;
 pub mod pending_input_preview;
 mod renderable;
 pub mod tool_card;
@@ -333,7 +334,7 @@ impl Renderable for ChatWidget {
 
         let area = _area;
 
-        // Repaint the full chat area with the deepseek-ink background each
+        // Repaint the full chat area with the codewhale-ink background each
         // frame. Ratatui's `Paragraph` only writes cells that contain text,
         // so cells the current frame's paragraph doesn't touch would
         // otherwise hold the *previous* frame's contents (the `:24Z`
@@ -583,7 +584,7 @@ impl Renderable for ComposerWidget<'_> {
                     SubmitDisposition::Immediate => {
                         if queue_count > 0 {
                             (
-                                Some(format!("↵ send ({} queued)", queue_count)),
+                                Some(format!("↵ send ({queue_count} queued)")),
                                 palette::DEEPSEEK_SKY,
                             )
                         } else {
@@ -637,32 +638,11 @@ impl Renderable for ComposerWidget<'_> {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border_color))
                 .style(background);
-            // Top-right corner: session title (muted) + vim mode indicator.
-            {
-                let mut right_spans: Vec<Span> = Vec::new();
-                if let Some(title) = self.app.session_title.as_deref() {
-                    right_spans.push(Span::styled(
-                        title,
-                        Style::default().fg(palette::TEXT_MUTED),
-                    ));
-                }
-                if self.app.composer.vim_enabled {
-                    let color = match self.app.composer.vim_mode {
-                        VimMode::Normal => palette::TEXT_MUTED,
-                        VimMode::Insert => palette::DEEPSEEK_SKY,
-                        VimMode::Visual => palette::MODE_PLAN,
-                    };
-                    if !right_spans.is_empty() {
-                        right_spans.push(Span::raw("  "));
-                    }
-                    right_spans.push(Span::styled(
-                        self.app.composer.vim_mode.label(),
-                        Style::default().fg(color).bold(),
-                    ));
-                }
-                if !right_spans.is_empty() {
-                    block = block.title_top(Line::from(right_spans).right_aligned());
-                }
+            // Top-right corner: editor state plus transient turn receipts.
+            // Receipts are lifecycle chrome, not transcript content; they
+            // should appear briefly without displacing conversation rows.
+            if let Some(chrome) = composer_top_right_chrome(self.app, area.width) {
+                block = block.title_top(chrome.right_aligned());
             }
             if let Some(hint_line) = hint_line {
                 block = block.title_bottom(hint_line);
@@ -1921,6 +1901,115 @@ fn char_display_width(ch: char) -> usize {
     }
 }
 
+fn truncate_display_width(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return text.chars().take(max_width).collect();
+    }
+
+    let mut out = String::new();
+    let mut width = 0usize;
+    let limit = max_width.saturating_sub(3);
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > limit {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push_str("...");
+    out
+}
+
+fn vim_mode_style(mode: VimMode) -> Style {
+    let color = match mode {
+        VimMode::Normal => palette::TEXT_MUTED,
+        VimMode::Insert => palette::DEEPSEEK_SKY,
+        VimMode::Visual => palette::MODE_PLAN,
+    };
+    Style::default().fg(color).bold()
+}
+
+fn composer_top_right_chrome(app: &App, area_width: u16) -> Option<Line<'static>> {
+    let receipt = app.active_receipt_text();
+    let session_title = app.session_title.as_deref();
+    if !app.composer.vim_enabled && receipt.is_none() && session_title.is_none() {
+        return None;
+    }
+
+    // Leave room for the left title and both borders. On narrow panes, skip
+    // extra chrome rather than letting status text collide with "Composer".
+    let max_width = usize::from(area_width.saturating_sub(18));
+    if max_width < 4 {
+        return None;
+    }
+
+    let receipt_style = Style::default()
+        .fg(palette::STATUS_SUCCESS)
+        .add_modifier(Modifier::DIM);
+    if let Some(receipt) = receipt {
+        let receipt_text = receipt.trim();
+        if app.composer.vim_enabled {
+            let vim_label = app.composer.vim_mode.label();
+            let vim_width = UnicodeWidthStr::width(vim_label);
+            let sep_width = UnicodeWidthStr::width(" · ");
+            if vim_width + sep_width + 4 <= max_width {
+                let receipt_width = max_width.saturating_sub(vim_width + sep_width);
+                return Some(Line::from(vec![
+                    Span::styled(vim_label.to_string(), vim_mode_style(app.composer.vim_mode)),
+                    Span::styled(" · ", Style::default().fg(palette::TEXT_MUTED)),
+                    Span::styled(
+                        truncate_display_width(receipt_text, receipt_width),
+                        receipt_style,
+                    ),
+                ]));
+            }
+        }
+
+        return Some(Line::from(Span::styled(
+            truncate_display_width(receipt_text, max_width),
+            receipt_style,
+        )));
+    }
+
+    // No receipt: show vim mode (if enabled) + session title (if present).
+    let mut spans: Vec<Span> = Vec::new();
+    if app.composer.vim_enabled {
+        spans.push(Span::styled(
+            app.composer.vim_mode.label().to_string(),
+            vim_mode_style(app.composer.vim_mode),
+        ));
+    }
+    if let Some(title) = session_title {
+        let used: usize = spans
+            .iter()
+            .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+            .sum();
+        let sep = if spans.is_empty() { 0 } else { 2 };
+        let remaining = max_width.saturating_sub(used + sep);
+        if remaining >= 4 {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                truncate_display_width(title, remaining),
+                Style::default().fg(palette::TEXT_MUTED),
+            ));
+        }
+    }
+    if spans.is_empty() {
+        None
+    } else {
+        Some(Line::from(spans))
+    }
+}
+
 fn should_render_empty_state(app: &App) -> bool {
     app.history.is_empty() && !app.is_loading && !app.is_compacting
 }
@@ -1937,7 +2026,7 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
 
     let body = vec![
         Line::from(Span::styled(
-            format!("{inset}>_ DeepSeek TUI (v{})", env!("CARGO_PKG_VERSION")),
+            format!("{inset}>_ codewhale (v{})", env!("CARGO_PKG_VERSION")),
             Style::default().fg(palette::DEEPSEEK_BLUE).bold(),
         )),
         Line::from(""),
@@ -2568,7 +2657,7 @@ mod tests {
     fn slash_completion_hints_exclude_set_and_deepseek_commands() {
         let hints = slash_completion_hints("/", 128, &[], Locale::En, None, ApiProvider::Deepseek);
         assert!(!hints.iter().any(|hint| hint.name == "/set"));
-        assert!(!hints.iter().any(|hint| hint.name == "/deepseek"));
+        assert!(!hints.iter().any(|hint| hint.name == "/codewhale"));
     }
 
     #[test]
@@ -2839,6 +2928,30 @@ mod tests {
     }
 
     #[test]
+    fn composer_border_renders_active_turn_receipt() {
+        let mut app = create_test_app();
+        app.composer_density = ComposerDensity::Comfortable;
+        app.set_receipt_text("✓ turn completed · 2 tool(s) used");
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 96,
+            height: 5,
+        };
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert!(rendered.contains("Composer"));
+        assert!(rendered.contains("turn completed"));
+        assert!(rendered.contains("tool(s) used"));
+    }
+
+    #[test]
     fn slash_menu_open_locks_composer_height_against_match_count_changes() {
         // Repro for the Windows 10 PowerShell + WSL feedback: typing
         // through a slash command shrinks the matched-entry list, which
@@ -2960,7 +3073,7 @@ mod tests {
     #[test]
     fn empty_state_shows_startup_context() {
         let mut app = create_test_app();
-        app.workspace = PathBuf::from("/tmp/deepseek-test-workspace");
+        app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
         app.model = "deepseek-v4-pro".to_string();
 
         let lines = build_empty_state_lines(&app, Rect::new(0, 0, 100, 20));
@@ -2975,9 +3088,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains(&format!(">_ DeepSeek TUI (v{})", env!("CARGO_PKG_VERSION"))));
+        assert!(rendered.contains(&format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"))));
         assert!(rendered.contains("model: deepseek-v4-pro  /model to switch"));
-        assert!(rendered.contains("directory: /tmp/deepseek-test-workspace"));
+        assert!(rendered.contains("directory: /tmp/codewhale-test-workspace"));
     }
 
     /// Probe: confirm `cell.lines_with_motion` returns no Line whose total
@@ -3109,6 +3222,35 @@ mod tests {
         assert_eq!(
             buf[(area.x + area.width - 1, area.y + area.height - 1)].bg,
             custom
+        );
+    }
+
+    #[test]
+    fn chat_widget_does_not_render_turn_receipt_as_transcript_content() {
+        let mut app = create_test_app();
+        for i in 0..8 {
+            app.add_message(HistoryCell::Assistant {
+                content: format!("assistant line {i}"),
+                streaming: false,
+            });
+        }
+        app.set_receipt_text("✓ turn completed · 2 tool(s) used");
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 48,
+            height: 6,
+        };
+        let mut buf = Buffer::empty(area);
+        let widget = ChatWidget::new(&mut app, area);
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert!(!rendered.contains("turn completed"));
+        assert!(
+            rendered.contains("assistant line 7"),
+            "receipt should not displace the latest transcript line: {rendered:?}"
         );
     }
 
@@ -3458,7 +3600,7 @@ mod tests {
     /// pays the wrap cost; subsequent calls at different offsets should hit
     /// the per-cell cache and be ~constant time regardless of offset.
     ///
-    /// Run with: `cargo test -p deepseek-tui --release bench_transcript_scroll
+    /// Run with: `cargo test -p codewhale-tui --release bench_transcript_scroll
     /// -- --ignored --nocapture`
     // Perf bench prints timing rows to stdout — runs in `cargo test`,
     // never inside the TUI alt-screen.

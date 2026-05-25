@@ -45,6 +45,7 @@ pub enum CommandPaletteAction {
     ExecuteCommand { command: String },
     InsertText { text: String },
     OpenTextPager { title: String, content: String },
+    VoiceInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,7 +258,7 @@ impl ViewStack {
     pub fn push<V: ModalView + 'static>(&mut self, view: V) {
         let kind = view.kind();
         self.views.push(Box::new(view));
-        tracing::debug!(target: "deepseek_tui::view_stack", action = "push", kind = ?kind, depth = self.views.len(), "view pushed");
+        tracing::debug!(target: "codewhale_tui::view_stack", action = "push", kind = ?kind, depth = self.views.len(), "view pushed");
     }
 
     /// Push an already-boxed view back onto the stack. Used by call sites
@@ -266,13 +267,13 @@ impl ViewStack {
     pub fn push_boxed(&mut self, view: Box<dyn ModalView>) {
         let kind = view.kind();
         self.views.push(view);
-        tracing::debug!(target: "deepseek_tui::view_stack", action = "push_boxed", kind = ?kind, depth = self.views.len(), "view pushed");
+        tracing::debug!(target: "codewhale_tui::view_stack", action = "push_boxed", kind = ?kind, depth = self.views.len(), "view pushed");
     }
 
     pub fn pop(&mut self) -> Option<Box<dyn ModalView>> {
         let popped = self.views.pop();
         if let Some(view) = popped.as_ref() {
-            tracing::debug!(target: "deepseek_tui::view_stack", action = "pop", kind = ?view.kind(), depth = self.views.len(), "view popped");
+            tracing::debug!(target: "codewhale_tui::view_stack", action = "pop", kind = ?view.kind(), depth = self.views.len(), "view popped");
         }
         popped
     }
@@ -330,7 +331,7 @@ impl ViewStack {
             ViewAction::None => {}
             ViewAction::Close => {
                 if let Some(view) = self.views.pop() {
-                    tracing::debug!(target: "deepseek_tui::view_stack", action = "close", kind = ?view.kind(), depth = self.views.len(), "view closed via action");
+                    tracing::debug!(target: "codewhale_tui::view_stack", action = "close", kind = ?view.kind(), depth = self.views.len(), "view closed via action");
                 }
             }
             ViewAction::Emit(event) => {
@@ -339,7 +340,7 @@ impl ViewStack {
             ViewAction::EmitAndClose(event) => {
                 events.push(event);
                 if let Some(view) = self.views.pop() {
-                    tracing::debug!(target: "deepseek_tui::view_stack", action = "emit_and_close", kind = ?view.kind(), depth = self.views.len(), "view closed via action");
+                    tracing::debug!(target: "codewhale_tui::view_stack", action = "emit_and_close", kind = ?view.kind(), depth = self.views.len(), "view closed via action");
                 }
             }
         }
@@ -746,6 +747,23 @@ impl ConfigView {
                 scope: ConfigScope::Saved,
             },
             ConfigRow {
+                section: ConfigSection::Composer,
+                key: "voice_input_command".to_string(),
+                value: settings
+                    .voice_input_command
+                    .clone()
+                    .unwrap_or_else(|| "(not configured)".to_string()),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
+                section: ConfigSection::Composer,
+                key: "voice_input_timeout_secs".to_string(),
+                value: settings.voice_input_timeout_secs.to_string(),
+                editable: true,
+                scope: ConfigScope::Saved,
+            },
+            ConfigRow {
                 section: ConfigSection::Sidebar,
                 key: "sidebar_width".to_string(),
                 value: settings.sidebar_width_percent.to_string(),
@@ -1128,6 +1146,8 @@ fn config_hint_for_key(key: &str) -> &'static str {
         "max_history" => "integer (0 allowed)",
         "default_model" => "deepseek-v4-pro | deepseek-v4-flash | deepseek-* | none/default",
         "reasoning_effort" => "auto | off | low | medium | high | max | default",
+        "voice_input_command" => "command string | none/default",
+        "voice_input_timeout_secs" => "1..=600",
         "mcp_config_path" => "path to mcp.json",
         _ => "",
     }
@@ -1227,6 +1247,18 @@ impl ModalView for ConfigView {
                 ViewAction::None
             }
             KeyCode::Backspace => {
+                if !self.filter.is_empty() {
+                    self.update_filter(|filter| {
+                        filter.pop();
+                    });
+                }
+                ViewAction::None
+            }
+            // Ctrl+H is the legacy ASCII backspace many terminals emit.
+            KeyCode::Char('h')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 if !self.filter.is_empty() {
                     self.update_filter(|filter| {
                         filter.pop();
@@ -1536,6 +1568,7 @@ pub(crate) fn subagent_view_agents(
                 SubAgentStatus::Running,
                 progress,
                 Some("live"),
+                None, // live rows compute nickname from agent manager on render
             ));
         }
     }
@@ -1553,6 +1586,7 @@ pub(crate) fn subagent_view_agents(
                     lifecycle_to_subagent_status(card.status),
                     card.summary.as_deref().unwrap_or(card.agent_type.as_str()),
                     Some("transcript"),
+                    None, // transcript-derived rows get nickname from manager on render
                 ));
             }
             HistoryCell::SubAgent(SubAgentCell::Fanout(card)) => {
@@ -1569,6 +1603,7 @@ pub(crate) fn subagent_view_agents(
                             lifecycle_to_subagent_status(worker.status),
                             &objective,
                             Some(card.kind.as_str()),
+                            None, // fanout worker rows get nickname from manager on render
                         ));
                     }
                 }
@@ -1595,6 +1630,7 @@ fn live_subagent_result(
     status: SubAgentStatus,
     objective: &str,
     role: Option<&str>,
+    nickname: Option<String>,
 ) -> SubAgentResult {
     SubAgentResult {
         name: agent_id.to_string(),
@@ -1607,7 +1643,7 @@ fn live_subagent_result(
             role: role.map(str::to_string),
         },
         model: String::new(),
-        nickname: None,
+        nickname,
         status,
         result: None,
         steps_taken: 0,
@@ -1717,7 +1753,7 @@ impl ModalView for SubAgentsView {
             let mut summary_parts = Vec::new();
             for (label, count, color) in status_summary {
                 summary_parts.push(Line::from(Span::styled(
-                    format!("{}: {}", label, count),
+                    format!("{label}: {count}"),
                     Style::default().fg(color),
                 )));
             }
@@ -1849,15 +1885,19 @@ fn append_subagent_group(
 
     for agent in agents {
         let id = truncate_view_text(&agent.agent_id, 11);
+        let display_name = agent
+            .nickname
+            .as_deref()
+            .map(|nick| format!("{nick:<12}"))
+            .unwrap_or_else(|| format!("{id:<12}"));
         let kind = format_agent_type(&agent.agent_type);
         let (status, status_style, status_detail) = format_agent_status(&agent.status);
 
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(
-                format!("{id:<12}"),
-                Style::default().fg(palette::TEXT_PRIMARY),
-            ),
+            Span::styled(display_name, Style::default().fg(palette::TEXT_PRIMARY)),
+            Span::raw(" "),
+            Span::styled(format!("{id:<11}"), Style::default().fg(palette::TEXT_DIM)),
             Span::styled(
                 format!("{kind:<9}"),
                 Style::default().fg(palette::TEXT_MUTED),
@@ -2161,6 +2201,8 @@ mod tests {
         assert!(keys.contains(&"composer_border"));
         assert!(keys.contains(&"composer_vim_mode"));
         assert!(keys.contains(&"bracketed_paste"));
+        assert!(keys.contains(&"voice_input_command"));
+        assert!(keys.contains(&"voice_input_timeout_secs"));
         assert!(keys.contains(&"context_panel"));
         assert!(keys.contains(&"cost_currency"));
         assert!(keys.contains(&"prefer_external_pdftotext"));

@@ -298,7 +298,7 @@ pub struct Engine {
     /// can fan completion events back into the engine.
     tx_subagent_completion: mpsc::UnboundedSender<SubAgentCompletion>,
     /// Receiver paired with `tx_subagent_completion`. Drained at the
-    /// turn-loop's empty-tool_uses branch to surface `<deepseek:subagent.done>`
+    /// turn-loop's empty-tool_uses branch to surface `<codewhale:subagent.done>`
     /// sentinels into the parent's transcript before deciding to end the turn.
     pub(super) rx_subagent_completion: mpsc::UnboundedReceiver<SubAgentCompletion>,
     cancel_token: CancellationToken,
@@ -378,8 +378,8 @@ impl Engine {
 
         Some(format!(
             "The rejected key came from {env_var}; no saved config key is present.\n\
-             Run `deepseek auth status` to inspect credential sources, then \
-             `deepseek auth set --provider {provider}` to save a valid key in ~/.deepseek/config.toml, \
+             Run `codewhale auth status` to inspect credential sources, then \
+             `codewhale auth set --provider {provider}` to save a valid key in ~/.deepseek/config.toml, \
              or remove the stale export and open a fresh shell.",
             provider = provider.as_str()
         ))
@@ -443,6 +443,7 @@ impl Engine {
                     project_context_pack_enabled: config.project_context_pack_enabled,
                     locale_tag: &config.locale_tag,
                     translation_enabled: config.translation_enabled,
+                    model_id: &config.model,
                 },
                 session.approval_mode,
             );
@@ -1363,7 +1364,7 @@ impl Engine {
                 "Emergency compaction complete: {before_count} → {after_count} messages ({removed} removed), ~{before_tokens} → ~{after_tokens} tokens"
             );
             if retries_used > 0 {
-                details.push_str(&format!(" ({} retries)", retries_used));
+                details.push_str(&format!(" ({retries_used} retries)"));
             }
             if trimmed > 0 {
                 details.push_str(&format!(", trimmed {trimmed} oldest"));
@@ -1382,8 +1383,7 @@ impl Engine {
 
         let message = format!(
             "Emergency context compaction failed to reduce request below model limit \
-             (estimate ~{} tokens, budget ~{}).",
-            after_tokens, target_budget
+             (estimate ~{after_tokens} tokens, budget ~{target_budget})."
         );
         self.emit_compaction_failed(id, true, message.clone()).await;
         let _ = self.tx_event.send(Event::status(message)).await;
@@ -1416,6 +1416,13 @@ impl Engine {
         .with_features(self.config.features.clone())
         .with_shell_manager(self.shell_manager.clone())
         .with_runtime_services(self.config.runtime_services.clone())
+        .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
+            self.session.id.clone(),
+            self.session.model.clone(),
+            self.session.workspace.clone(),
+            self.session.system_prompt.clone(),
+            self.session.messages.clone(),
+        ))
         .with_cancel_token(self.cancel_token.clone())
         .with_trusted_external_paths(trusted_external_paths);
 
@@ -1818,6 +1825,7 @@ impl Engine {
                 project_context_pack_enabled: self.config.project_context_pack_enabled,
                 locale_tag: &self.config.locale_tag,
                 translation_enabled: self.config.translation_enabled,
+                model_id: &self.config.model,
             },
             self.session.approval_mode,
         );
